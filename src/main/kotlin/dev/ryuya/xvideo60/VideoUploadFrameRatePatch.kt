@@ -10,6 +10,8 @@ import app.morphe.patcher.patch.mutableClassDefBy
 import app.morphe.patcher.patch.packageMetadata
 import app.morphe.patcher.patch.patch
 import com.android.tools.smali.dexlib2.Opcode
+import com.android.tools.smali.dexlib2.builder.BuilderOffsetInstruction
+import com.android.tools.smali.dexlib2.builder.MutableMethodImplementation
 import com.android.tools.smali.dexlib2.builder.instruction.BuilderInstruction21s
 import com.android.tools.smali.dexlib2.builder.instruction.BuilderInstruction22t
 import com.android.tools.smali.dexlib2.builder.instruction.BuilderInstruction35c
@@ -32,6 +34,18 @@ private const val X_PACKAGE = "com.twitter.android"
 private const val VIDEO_ENCODER_PACKAGE = "Lcom/twitter/media/transcode/video/"
 
 private val verifiedVersions = mapOf(
+    "11.0.0-release.0" to "311000000",
+    "11.10.0-release.0" to "311100000",
+    "11.20.0-release.0" to "311200000",
+    "11.30.0-release.0" to "311300000",
+    "11.40.0-release.0" to "311400000",
+    "11.69.0-release.0" to "311690000",
+    "11.70.0-release.0" to "311700000",
+    "11.77.0-release.0" to "311770000",
+    "11.81.0-release.0" to "311810000",
+    "11.99.0-release.1" to "311990001",
+    "12.2.0-release.0" to "312020000",
+    "12.7.1-release.0" to "312071000",
     "12.11.0-release.0" to "312110000",
     "12.17.0-release.0" to "312170000",
     "12.19.1-release.0" to "312191000",
@@ -69,8 +83,7 @@ val videoUploadFrameRatePatch = patch(
         }
         val implementation = method.implementation
             ?: throw PatchException("The legacy X video encoder constructor has no bytecode.")
-        val instructions = implementation.instructions
-        val cap = findFrameRateCap(instructions, method.definingClass)
+        val cap = findFrameRateCap(implementation, method.definingClass)
             ?: throw PatchException("The legacy X encoder's frame-rate logic differs from the supported versions.")
 
         // Keep the original config lookup as the input metadata fallback. Use the new limit for
@@ -106,7 +119,8 @@ private data class FrameRateCap(
     val limitRegister: Int,
 )
 
-private fun findFrameRateCap(instructions: List<Instruction>, owner: String): FrameRateCap? {
+private fun findFrameRateCap(implementation: MutableMethodImplementation, owner: String): FrameRateCap? {
+    val instructions = implementation.instructions
     val flag = instructions.indices.filter { instructions[it].isFrameRateFlag() }.singleOrNull() ?: return null
     if (flag + 16 >= instructions.size) return null
     val flagRegister = (instructions[flag] as? OneRegisterInstruction)?.registerA ?: return null
@@ -147,16 +161,34 @@ private fun findFrameRateCap(instructions: List<Instruction>, owner: String): Fr
         compare.registerB != fallback
     ) return null
 
-    // The original default register is reused by the assertion just before Math.min and then dies.
+    // The default register is reused by the assertion before Math.min. Some older constructors
+    // also read it from failure branches reached during encoder setup, before this cap is set.
     val assertion = instructions[minIndex - 1] as? BuilderInstruction35c ?: return null
     val limitRegister = default.registerA
     if (assertion.opcode != Opcode.INVOKE_STATIC || assertion.registerCount != 1 ||
         (assertion.reference as? MethodReference)?.parameterTypes != listOf("Z") ||
         assertion.registerC != limitRegister || limitRegister == fallback || limitRegister == source ||
-        instructions.drop(minIndex).any { it.usesRegister(limitRegister) }
+        !implementation.canReuseRegisterUntilReturn(minIndex, limitRegister)
     ) return null
 
     return FrameRateCap(minIndex, min, compareIndex, compare, limitRegister)
+}
+
+private fun MutableMethodImplementation.canReuseRegisterUntilReturn(start: Int, register: Int): Boolean {
+    val end = (start until instructions.size).firstOrNull { instructions[it].opcode == Opcode.RETURN_VOID }
+        ?: return false
+    val path = start..end
+    val firstAddress = instructions[start].location.codeAddress
+    val lastAddress = instructions[end].location.codeAddress
+
+    if (path.any { instructions[it].usesRegister(register) } ||
+        tryBlocks.any { it.startCodeAddress <= lastAddress && it.startCodeAddress + it.codeUnitCount > firstAddress }
+    ) return false
+
+    return instructions.filterIsInstance<BuilderOffsetInstruction>().none { branch ->
+        val target = branch.target.location.index
+        if (branch.location.index in path) target !in path else target in (start + 1)..end
+    }
 }
 
 private fun BuilderInstruction35c.isSourceRateRead(fallback: Int): Boolean {
